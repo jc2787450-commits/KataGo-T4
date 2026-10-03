@@ -5056,12 +5056,12 @@ struct ComputeHandle {
 #else
       cudaHandles->fusedFFNEnabled = false;
 #endif
-      // The hand-written Turing kernel fills the sm_75 gap the CUTLASS kernel does not cover.
+      // The hand-written Turing kernel fills the sm_75 gap the CUTLASS kernel does not cover,
+      // but on T4 it measured ~1.35x slower per FFN layer than cublas's turing_h1688gemm pair
+      // (32x32 warp sub-tiles re-read smem 2-4x per k-step), which outweighs the saved
+      // intermediate memory traffic. So it is opt-in only: explicit cudaUseFusedFFN = true.
       bool wantSm75FusedFFN =
-        !cudaHandles->fusedFFNEnabled &&
-        (context->useFusedFFNMode == enabled_t::True ||
-         (context->useFusedFFNMode == enabled_t::Auto &&
-          majorComputeCapability == 7 && minorComputeCapability == 5));
+        !cudaHandles->fusedFFNEnabled && context->useFusedFFNMode == enabled_t::True;
       bool sm75FusedFFNProbeOk = wantSm75FusedFFN && useFP16 && CudaFusedFFNSm75::supportedOnCurrentDevice();
       cudaHandles->fusedFFNSm75Enabled = sm75FusedFFNProbeOk;
       if(context->useFusedFFNMode == enabled_t::True && !cudaHandles->fusedFFNEnabled && !cudaHandles->fusedFFNSm75Enabled)
