@@ -282,7 +282,7 @@ flashAttentionMmaKernel(
   issueTileLoad(0, 0);
 #else
   issueTileLoad(0);
-  storeTileStage(0, 0);
+  storeTileStage(0);
   if(numKvTiles > 1)
     issueTileLoad(1);
 #endif
