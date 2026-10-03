@@ -2131,6 +2131,64 @@ void applyCScaleBiasNHWCSiluMaskHalfKernel(const half* in, half* out, const half
 #endif
 }
 
+#ifdef KATAGO_GPU_CUDA
+//Vectorized (8 halfs = 16 bytes) variant of the un-masked NHWC scale+bias+activation half
+//kernels above. The scalar kernels issue one 16-bit load per scale, bias, input, and output
+//element, which makes them latency-bound; grouping 8 channels per thread quarters the memory
+//instruction count. Numerically identical per element: the same __hfma on the same half
+//values (as __hfma2 pairs), relu with the same __hgt select, and silu computed in FP32 with
+//the same expression as siluh. Requires cSize % 8 == 0 and 16-byte-aligned in/out/scale/
+//biases pointers, which sharedApplyCScaleBiasNHWC checks before dispatching here.
+template <int ACTIVATION>
+__global__
+void applyCScaleBiasNHWCVecHalfKernel(const half* in, half* out, const half* scale, const half* biases, int sSize, int cSize)
+{
+#ifdef KATAGO_GPU_SUPPORTS_FP16
+  int c8 = blockIdx.x * blockDim.x + threadIdx.x;  // 8-channel group index
+  int sIdx = blockIdx.y * blockDim.y + threadIdx.y;
+  int nIdx = blockIdx.z;
+  if(c8 < (cSize >> 3) && sIdx < sSize) {
+    int idx = (nIdx * sSize + sIdx) * cSize + c8 * 8;
+    uint4 inV = *reinterpret_cast<const uint4*>(in + idx);
+    uint4 scaleV = *reinterpret_cast<const uint4*>(scale + c8 * 8);
+    uint4 biasV = *reinterpret_cast<const uint4*>(biases + c8 * 8);
+    const __half2* vin = reinterpret_cast<const __half2*>(&inV);
+    const __half2* vscale = reinterpret_cast<const __half2*>(&scaleV);
+    const __half2* vbias = reinterpret_cast<const __half2*>(&biasV);
+    uint4 outV;
+    __half2* vout = reinterpret_cast<__half2*>(&outV);
+    #pragma unroll
+    for(int i = 0; i < 4; i++) {
+      __half2 a = __hfma2(vin[i], vscale[i], vbias[i]);
+      if(ACTIVATION == ACTIVATION_IDENTITY) {
+        vout[i] = a;
+      }
+      else if(ACTIVATION == ACTIVATION_RELU) {
+        //Same select as the scalar kernel, so -0.0 also canonicalizes to +0.0.
+        half a0 = __low2half(a);
+        half a1 = __high2half(a);
+        const half halfzero = __float2half(0.0f);
+        vout[i] = __halves2half2(
+          __hgt(a0, halfzero) ? a0 : halfzero,
+          __hgt(a1, halfzero) ? a1 : halfzero);
+      }
+      else {  // ACTIVATION_SILU, same FP32 expression as siluh
+        float x0 = __half2float(__low2half(a));
+        float x1 = __half2float(__high2half(a));
+        vout[i] = __halves2half2(
+          __float2half(x0 / (1.0f + expf(-x0))),
+          __float2half(x1 / (1.0f + expf(-x1))));
+      }
+    }
+    *reinterpret_cast<uint4*>(out + idx) = outV;
+  }
+#else
+  //Do nothing, FP16 not supported
+#endif
+}
+#endif  // KATAGO_GPU_CUDA
+
+
 static void sharedApplyCScaleBiasNHWC(const void* in, void* out, const void* scale, const void* biases, const void* mask, int nSize, int xySize, int cSize, bool isHalf, int activation, cudaStream_t stream) {
   if(nSize > 65535)
     throw std::runtime_error("customCudaApplyCScaleBiasNHWC: nSize too large");
@@ -2139,6 +2197,32 @@ static void sharedApplyCScaleBiasNHWC(const void* in, void* out, const void* sca
   checkBufferIndexFitsInt(nSize, xySize, cSize, "customCudaApplyCScaleBiasNHWC");
 
   int sSize = xySize;
+
+#ifdef KATAGO_GPU_CUDA
+  //Vectorized 8-half path for the common un-masked FP16 case; falls through to the scalar
+  //kernels below whenever its preconditions do not hold (mask, non-half, odd channel count,
+  //unsupported activation, or misaligned buffers).
+  if(mask == NULL && isHalf && (cSize % 8) == 0 &&
+     (activation == ACTIVATION_IDENTITY || activation == ACTIVATION_RELU || activation == ACTIVATION_SILU) &&
+     (((size_t)in | (size_t)out | (size_t)scale | (size_t)biases) & 15) == 0
+  ) {
+    int cThreads;
+    int cBlocks;
+    int sThreads;
+    int sBlocks;
+    splitThreadsAcrossDim01(cSize / 8, sSize, cThreads, cBlocks, sThreads, sBlocks);
+    dim3 grid(cBlocks,sBlocks,nSize);
+    dim3 threads(cThreads,sThreads,1);
+    if(activation == ACTIVATION_IDENTITY)
+      applyCScaleBiasNHWCVecHalfKernel<ACTIVATION_IDENTITY><<<grid,threads,0,stream>>>((const half*)in,(half*)out,(const half*)scale,(const half*)biases,sSize,cSize);
+    else if(activation == ACTIVATION_RELU)
+      applyCScaleBiasNHWCVecHalfKernel<ACTIVATION_RELU><<<grid,threads,0,stream>>>((const half*)in,(half*)out,(const half*)scale,(const half*)biases,sSize,cSize);
+    else
+      applyCScaleBiasNHWCVecHalfKernel<ACTIVATION_SILU><<<grid,threads,0,stream>>>((const half*)in,(half*)out,(const half*)scale,(const half*)biases,sSize,cSize);
+    return;
+  }
+#endif
+
   int cThreads;
   int cBlocks;
   int sThreads;

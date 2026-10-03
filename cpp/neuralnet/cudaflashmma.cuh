@@ -20,8 +20,10 @@
 // worth the extra code paths and config surface.
 //
 // Requires sm_75+ at runtime. sm_80+ uses mma.sync.aligned.m16n8k16 f32.f16.f16.f32 with
-// cp.async prefetch. sm_75 uses pairs of mma.sync.aligned.m16n8k8 and synchronous copies
-// instead. For older archs the kernels compile to empty stubs, so the caller must check
+// cp.async prefetch. sm_75 uses pairs of mma.sync.aligned.m16n8k8 and, having no cp.async,
+// a register software pipeline instead: the next tile's global loads are staged in registers
+// while the current tile's mma work runs, then stored to shared memory. For older archs the
+// kernels compile to empty stubs, so the caller must check
 // flashAttentionMmaSupportedOnCurrentDevice() before dispatching here.
 
 #pragma once
@@ -185,8 +187,13 @@ flashAttentionMmaKernel(
   constexpr int KVVECS = BKV * (D / VEC);
   const int numKvTiles = (seqLen + BKV - 1) / BKV;
 
-  // Async-load a K/V/mask tile into the given buffer. Rows past seqLen zero-fill, and their
-  // mask bias is -inf so they are excluded from the softmax regardless.
+  // Load a K/V/mask tile. Rows past seqLen zero-fill, and their mask bias is -inf so they
+  // are excluded from the softmax regardless. sm_80+: cp.async straight into the given
+  // shared buffer. sm_75 has no cp.async: the tile is staged into registers here and a
+  // separate storeTileStage call moves it to shared memory, so the global-load latency of
+  // tile t+2 can overlap the mma work on tile t (register software pipeline in place of
+  // cp.async's hardware one).
+#if __CUDA_ARCH__ >= 800
   auto issueTileLoad = [&](int tile, int buf) {
     const int kvStart = tile * BKV;
     #pragma unroll
@@ -214,10 +221,71 @@ flashAttentionMmaKernel(
     }
     fmmaCpAsyncCommit();
   };
+#else
+  constexpr int STAGE_VECS = KVVECS / NTHREADS;
+  static_assert(KVVECS % NTHREADS == 0, "staged K/V load count");
+  uint4 stageK[STAGE_VECS];
+  uint4 stageV[STAGE_VECS];
+  float stageMask = -CUDART_INF_F;
+  bool stageLive = false;
+  auto issueTileLoad = [&](int tile) {
+    const int kvStart = tile * BKV;
+    #pragma unroll
+    for(int s = 0; s < STAGE_VECS; s++) {
+      // Thread t covers STAGE_VECS vectors spaced NTHREADS apart, mirroring the sm_80 loop.
+      // The constexpr trip count keeps s a literal after unrolling so stageK/stageV stay in
+      // registers instead of spilling to local memory.
+      int t = tid + s * NTHREADS;
+      int row = t / (D / VEC);
+      int d0 = (t % (D / VEC)) * VEC;
+      int g = kvStart + row;
+      bool valid = g < seqLen;
+      // With valid == false the zero-fill must not dereference the source, but keep the
+      // address in range anyway rather than pointing up to a tile past the end of K/V.
+      size_t off = (size_t)(valid ? g : 0) * kvStride + d0;
+      stageK[s] = valid ? *reinterpret_cast<const uint4*>(Kbase + off) : make_uint4(0, 0, 0, 0);
+      stageV[s] = valid ? *reinterpret_cast<const uint4*>(Vbase + off) : make_uint4(0, 0, 0, 0);
+    }
+    // Same additive mask bias as the sm_80 path, but computed at load time and kept in a
+    // register until the store (ballot included, so it stays a warp-collective op).
+    if(tid < BKV) {
+      int g = kvStart + tid;
+      stageLive = g < seqLen && (maskBase == NULL || (float)maskBase[g] != 0.0f);
+      stageMask = stageLive ? 0.0f : -CUDART_INF_F;
+    }
+  };
+  // Move the staged tile into the given shared buffer. Must run behind a __syncthreads()
+  // that guarantees every reader of this buffer finished two half-iterations of the loop ago.
+  auto storeTileStage = [&](int buf) {
+    #pragma unroll
+    for(int s = 0; s < STAGE_VECS; s++) {
+      int t = tid + s * NTHREADS;
+      int row = t / (D / VEC);
+      int d0 = (t % (D / VEC)) * VEC;
+      *reinterpret_cast<uint4*>(&kTiles[buf][row * ST + d0]) = stageK[s];
+      *reinterpret_cast<uint4*>(&vTiles[buf][row * ST + d0]) = stageV[s];
+    }
+    if(tid < BKV) {
+      maskTiles[buf][tid] = stageMask;
+      uint32_t ballot = __ballot_sync(0xffffffff, stageLive);
+      if((tid & 31) == 0)
+        anyLiveParts[buf][tid >> 5] = (int)ballot;
+    }
+  };
+#endif
 
   // Prologue: start loading kv tile 0, and stage Q into buffer 1's K space (coalesced),
-  // zero-filled past seqLen.
+  // zero-filled past seqLen. On sm_75 tile 0 goes registers -> shared immediately, then the
+  // tile 1 register load is issued so its LDG latency overlaps the Q staging below; the store
+  // must precede that load or the staged registers would be overwritten before use.
+#if __CUDA_ARCH__ >= 800
   issueTileLoad(0, 0);
+#else
+  issueTileLoad(0);
+  storeTileStage(0, 0);
+  if(numKvTiles > 1)
+    issueTileLoad(1);
+#endif
   {
     half* qTile = kTiles[1];
     constexpr int QVECS = BQ * (D / VEC);
@@ -261,13 +329,27 @@ flashAttentionMmaKernel(
   }
 
   for(int tile = 0; tile < numKvTiles; tile++) {
-    // Wait for this tile's async loads, then start prefetching the next tile. The barrier
-    // also guarantees the buffer being written was fully consumed two iterations ago
-    // (and, on the first iteration, that all warps have read their Q fragments).
+    // Make this tile's data ready, then start prefetching the next tile. The barrier also
+    // guarantees the buffer being (over)written below was fully consumed by the previous
+    // iteration's ldmatrix reads (and, on the first iteration, that all warps have read
+    // their Q fragments, freeing buffer 1's K space that Q was staged through).
+#if __CUDA_ARCH__ >= 800
     fmmaCpAsyncWaitAll();
     __syncthreads();
     if(tile + 1 < numKvTiles)
       issueTileLoad(tile + 1, (tile + 1) & 1);
+#else
+    // sm_75: tile+1's K/V/mask already sit in registers, loaded while tile's mma work ran
+    // (or in the prologue). Store them into the other buffer, then issue the register load
+    // for tile+2 so its global latency overlaps tile's mma work below. The next iteration's
+    // barrier makes the stored tile visible to its ldmatrix reads.
+    __syncthreads();
+    if(tile + 1 < numKvTiles) {
+      storeTileStage((tile + 1) & 1);
+      if(tile + 2 < numKvTiles)
+        issueTileLoad(tile + 2);
+    }
+#endif
 
     // Skip tiles with no live keys: they contribute nothing to max, sum, or output.
     {

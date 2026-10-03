@@ -2528,12 +2528,37 @@ class TransformerAttentionBlock(torch.nn.Module):
                 scale=scale,
             )
         elif not wants_attn_weights:
+            q_sdp, k_sdp, v_sdp, mask_sdp = q, k, v, attn_mask
+            # The memory-efficient SDPA backend rejects sequences / additive masks whose length
+            # is not a multiple of 8 (e.g. a 19x19 board's 361), silently falling back to the
+            # math backend that materializes the (B,H,S,S) attention matrix. On GPUs where the
+            # flex-attention Triton kernels are not profitable (pre-Ampere, e.g. Tesla T4),
+            # padding the sequence dimension to a multiple of 8 makes the memory-efficient
+            # kernel eligible. Padded query rows produce garbage that is sliced away, padded
+            # keys are -inf in the mask so they get zero attention weight, padded value rows
+            # are never read. Only broadcastable key-only masks (query dim 1) can be padded;
+            # dense per-query masks keep the old behavior.
+            if (
+                mask_sdp is not None
+                and mask_sdp.dim() == 4
+                and mask_sdp.shape[2] == 1
+                and seq_len % 8 != 0
+                and q_sdp.is_cuda
+                and q_sdp.dtype in (torch.float16, torch.bfloat16)
+            ):
+                pad_len = (-seq_len) % 8
+                q_sdp = torch.nn.functional.pad(q_sdp, (0, 0, 0, pad_len))
+                k_sdp = torch.nn.functional.pad(k_sdp, (0, 0, 0, pad_len))
+                v_sdp = torch.nn.functional.pad(v_sdp, (0, 0, 0, pad_len))
+                mask_sdp = torch.nn.functional.pad(mask_sdp, (0, pad_len), value=float("-inf"))
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
+                q_sdp, k_sdp, v_sdp,
+                attn_mask=mask_sdp,
                 dropout_p=0.0,
                 scale=scale,
             )
+            if mask_sdp is not attn_mask:
+                attn_output = attn_output[..., :seq_len, :]
         else:
             # Manual attention path to capture weights.
             logits = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, S, S)

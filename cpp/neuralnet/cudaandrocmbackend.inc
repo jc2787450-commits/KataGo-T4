@@ -557,6 +557,12 @@ struct CudaHandles {
   bool fusedFFNEnabled;
   bool loggedUsingFusedFFN;
   bool loggedFusedFFNRejected;
+  // Hand-written SM75 (Turing) fused FFN kernel (dual GEMM + SwiGLU, mma.sync f16, no CUTLASS
+  // dependency), covering Turing where the CUTLASS sm_80+ kernel does not apply. Must be set
+  // before Model construction like fusedFFNEnabled.
+  bool fusedFFNSm75Enabled;
+  bool loggedUsingFusedFFNSm75;
+  bool loggedFusedFFNSm75Rejected;
   bool loggedMmaAttentionRejectedShape;
   // Set once the first successful mma attention launch has been logged.
   bool loggedUsingMmaAttention;
@@ -587,6 +593,9 @@ struct CudaHandles {
       fusedFFNEnabled(false),
       loggedUsingFusedFFN(false),
       loggedFusedFFNRejected(false),
+      fusedFFNSm75Enabled(false),
+      loggedUsingFusedFFNSm75(false),
+      loggedFusedFFNSm75Rejected(false),
       loggedMmaAttentionRejectedShape(false),
       loggedUsingMmaAttention(false),
       loggedUsingGraphSDPA(false),
@@ -3272,13 +3281,17 @@ struct TransformerFFNBlock {
 
   // linear1 and the gate share the same shape and input, so their weights are packed
   // contiguously: in-major for the unfused strided-batched GEMM path, or out-major
-  // (transposed) when the CUTLASS fused kernel is used. Whether the fused kernel runs is
-  // decided once at construction, since its shape support depends only on dimensions and
-  // alignment, so only one layout is ever uploaded and the fused path never falls back at
-  // apply time.
+  // (transposed) when a fused kernel is used (CUTLASS sm_80+ or the hand-written sm_75 one).
+  // Which fused kernel runs is decided once at construction, since shape support depends only
+  // on dimensions and alignment, so only one layout is ever uploaded and the fused path never
+  // falls back at apply time.
   SharedDeviceBuf ffnPackedWeights;
-#if defined(KATAGO_GPU_CUDA) && defined(USE_CUTLASS_FUSED_FFN)
+#if defined(KATAGO_GPU_CUDA)
+  // usingFusedFFN: the CUTLASS dual GEMM (sm_80+, requires USE_CUTLASS_FUSED_FFN).
+  // usingFusedFFNSm75: the hand-written Turing kernel. Both consume the same out-major packed
+  // weights, and at most one is ever set.
   bool usingFusedFFN = false;
+  bool usingFusedFFNSm75 = false;
 #endif
 
   TransformerFFNBlock() = delete;
@@ -3314,7 +3327,8 @@ struct TransformerFFNBlock {
     testAssert(desc->linearGate.outChannels == desc->linear1.outChannels);
     testAssert(desc->linear1.inChannels == numChannels);
     testAssert(desc->linear1.outChannels == ffnChannels);
-#if defined(KATAGO_GPU_CUDA) && defined(USE_CUTLASS_FUSED_FFN)
+#if defined(KATAGO_GPU_CUDA)
+#ifdef USE_CUTLASS_FUSED_FFN
     if(cudaHandles->fusedFFNEnabled && useFP16) {
       usingFusedFFN = CudaFusedFFN::supportsShape(ffnChannels, numChannels);
       if(!usingFusedFFN && !cudaHandles->loggedFusedFFNRejected) {
@@ -3326,14 +3340,37 @@ struct TransformerFFNBlock {
             "), using the unfused path");
       }
     }
-    if(usingFusedFFN) {
-      if(!cudaHandles->loggedUsingFusedFFN) {
-        cudaHandles->loggedUsingFusedFFN = true;
+#endif
+    // The hand-written Turing kernel takes over where the CUTLASS kernel does not apply.
+    if(!usingFusedFFN && cudaHandles->fusedFFNSm75Enabled && useFP16) {
+      usingFusedFFNSm75 = CudaFusedFFNSm75::supportsShape(ffnChannels, numChannels);
+      if(!usingFusedFFNSm75 && !cudaHandles->loggedFusedFFNSm75Rejected) {
+        cudaHandles->loggedFusedFFNSm75Rejected = true;
         if(cudaHandles->logger != NULL)
-          cudaHandles->logger->write("Cuda backend: using CUTLASS fused FFN kernel");
+          cudaHandles->logger->write(
+            "Cuda backend: SM75 fused FFN kernel does not support this FFN shape (channels " +
+            Global::intToString(numChannels) + " -> " + Global::intToString(ffnChannels) +
+            "), using the unfused path");
+      }
+    }
+    if(usingFusedFFN || usingFusedFFNSm75) {
+      if(usingFusedFFN) {
+        if(!cudaHandles->loggedUsingFusedFFN) {
+          cudaHandles->loggedUsingFusedFFN = true;
+          if(cudaHandles->logger != NULL)
+            cudaHandles->logger->write("Cuda backend: using CUTLASS fused FFN kernel");
+        }
+      }
+      else {
+        if(!cudaHandles->loggedUsingFusedFFNSm75) {
+          cudaHandles->loggedUsingFusedFFNSm75 = true;
+          if(cudaHandles->logger != NULL)
+            cudaHandles->logger->write("Cuda backend: using SM75 (Turing) fused FFN kernel");
+        }
       }
       // Desc weights are in-major ([inC][outC] flat, what the cuBLAS path consumes directly),
-      // so transpose each to out-major for the fused kernel.
+      // so transpose each to out-major for the fused kernel. Both fused kernels share this
+      // out-major layout.
       const int inC = numChannels;
       const int outC = ffnChannels;
       vector<float> packedT((size_t)2 * outC * inC);
@@ -3403,24 +3440,34 @@ struct TransformerFFNBlock {
 #endif
 
     // Steps 2 and 3: linear1 and gate projections, then SwiGLU combining them. When chosen at
-    // construction, the CUTLASS fused dual GEMM computes all three in one kernel with no
-    // intermediate global memory traffic. Otherwise one strided-batched GEMM over the shared
-    // input runs both projections, then a separate SwiGLU kernel.
+    // construction, a fused dual GEMM kernel (CUTLASS sm_80+ or the hand-written sm_75 one)
+    // computes all three in one kernel with no intermediate global memory traffic. Otherwise
+    // one strided-batched GEMM over the shared input runs both projections, then a separate
+    // SwiGLU kernel.
     //Max-batch-sized. See the scratch-sizing note at the attention q/k/v buffers.
     SizedBuf<void*> ffnBuf(scratch->allocator, scratch->getBufSizeXY(2 * ffnChannels));
     void* gatePtr = (char*)ffnBuf.buf + scratch->getBufSizeXY(ffnChannels);
     bool usedFusedFFN = false;
-#if defined(KATAGO_GPU_CUDA) && defined(USE_CUTLASS_FUSED_FFN)
-    if(usingFusedFFN) {
+#if defined(KATAGO_GPU_CUDA)
+    if(usingFusedFFN || usingFusedFFNSm75) {
       // Same output-element-count limit the unfused SwiGLU path enforces below, for parity
-      // and so CUTLASS's int-based problem coordinates stay comfortably in range.
+      // and so both kernels' int-based problem coordinates stay comfortably in range.
       if((size_t)ffnChannels * (size_t)matBatchSize >= (size_t)2147483647)
         throw StringError(KATAGO_GPU_BACKEND_NAME " fused FFN element count exceeds the 32-bit limit");
       const half* w1 = (const half*)ffnPackedWeights.buf;
       const half* wGate = w1 + (size_t)ffnChannels * numChannels;
-      CudaFusedFFN::runSwiGLU(
-        (const half*)trunkScratchBuf, w1, wGate, (half*)ffnBuf.buf,
-        matBatchSize, ffnChannels, numChannels, cudaHandles->stream);
+      if(usingFusedFFN) {
+#ifdef USE_CUTLASS_FUSED_FFN
+        CudaFusedFFN::runSwiGLU(
+          (const half*)trunkScratchBuf, w1, wGate, (half*)ffnBuf.buf,
+          matBatchSize, ffnChannels, numChannels, cudaHandles->stream);
+#endif
+      }
+      else {
+        CudaFusedFFNSm75::runSwiGLU(
+          (const half*)trunkScratchBuf, w1, wGate, (half*)ffnBuf.buf,
+          matBatchSize, ffnChannels, numChannels, cudaHandles->stream);
+      }
       CUDA_ERR(name.c_str(), cudaPeekAtLastError());
       usedFusedFFN = true;
     }
@@ -4989,29 +5036,41 @@ struct ComputeHandle {
             "WARNING: Cuda backend: mma flash attention kernel not functional on this GPU/driver/build, transformer models will fall back to slower attention paths");
       }
     }
-#ifdef USE_CUTLASS_FUSED_FFN
-    // Decided before Model construction because TransformerFFNBlock commits to a weight layout
-    // based on it. The probe runs a real tiny dual GEMM, guarding the same empty-stub JIT
+    // Fused FFN decision, made before Model construction because TransformerFFNBlock commits to
+    // a weight layout based on it. Two kernels exist: the CUTLASS dual GEMM (sm_80+, needs
+    // USE_CUTLASS_FUSED_FFN) and a hand-written sm_75 kernel covering Turing, where the CUTLASS
+    // kernel does not apply. Both probes run real tiny GEMMs, guarding the same empty-stub JIT
     // hazard as the mma kernel plus any launch-time failure.
     {
+#ifdef USE_CUTLASS_FUSED_FFN
       bool wantFusedFFN =
         context->useFusedFFNMode == enabled_t::True ||
         (context->useFusedFFNMode == enabled_t::Auto && majorComputeCapability >= 8);
       bool fusedFFNProbeOk = wantFusedFFN && useFP16 && CudaFusedFFN::supportedOnCurrentDevice();
       cudaHandles->fusedFFNEnabled = fusedFFNProbeOk;
-      if(context->useFusedFFNMode == enabled_t::True && !cudaHandles->fusedFFNEnabled)
-        throw StringError(
-          "Cuda backend: cudaUseFusedFFN=true but the fused FFN kernel is not usable here (requires FP16 and a functional sm_80+ build)");
       // Same loudness policy as the mma attention probe above: losing this kernel on a GPU that
       // should support it is a large silent slowdown, so say so.
       if(wantFusedFFN && useFP16 && !fusedFFNProbeOk && logger != NULL)
         logger->write(
           "WARNING: Cuda backend: CUTLASS fused FFN kernel not functional on this GPU/driver/build, transformer models will use the slower unfused FFN path");
-    }
 #else
-    if(context->useFusedFFNMode == enabled_t::True)
-      throw StringError("Cuda backend: cudaUseFusedFFN=true but this build was compiled without CUTLASS (external/cutlass missing at build time)");
+      cudaHandles->fusedFFNEnabled = false;
 #endif
+      // The hand-written Turing kernel fills the sm_75 gap the CUTLASS kernel does not cover.
+      bool wantSm75FusedFFN =
+        !cudaHandles->fusedFFNEnabled &&
+        (context->useFusedFFNMode == enabled_t::True ||
+         (context->useFusedFFNMode == enabled_t::Auto &&
+          majorComputeCapability == 7 && minorComputeCapability == 5));
+      bool sm75FusedFFNProbeOk = wantSm75FusedFFN && useFP16 && CudaFusedFFNSm75::supportedOnCurrentDevice();
+      cudaHandles->fusedFFNSm75Enabled = sm75FusedFFNProbeOk;
+      if(context->useFusedFFNMode == enabled_t::True && !cudaHandles->fusedFFNEnabled && !cudaHandles->fusedFFNSm75Enabled)
+        throw StringError(
+          "Cuda backend: cudaUseFusedFFN=true but no fused FFN kernel is usable here (requires FP16 and a functional fused FFN kernel on this GPU/build)");
+      if(wantSm75FusedFFN && useFP16 && !sm75FusedFFNProbeOk && logger != NULL)
+        logger->write(
+          "WARNING: Cuda backend: SM75 fused FFN kernel not functional on this GPU/driver/build, transformer models will use the slower unfused FFN path");
+    }
     model = std::make_unique<Model>(
       cudaHandles.get(), &(loadedModel->modelDesc), maxBatchSize,
       nnXLen, nnYLen, inputsUseNHWC, useFP16, useNHWC

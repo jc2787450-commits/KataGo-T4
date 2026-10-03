@@ -29,6 +29,11 @@
 #include "../neuralnet/cudafusedffn.h"
 #endif
 
+// Hand-written SM75 (Turing) fused FFN. No CUTLASS dependency: compiled with every CUDA backend
+// build, so this include (and its call sites in cudaandrocmbackend.inc, guarded on
+// KATAGO_GPU_CUDA) needs no USE_CUTLASS_FUSED_FFN condition.
+#include "../neuralnet/cudafusedffnsm75.h"
+
 // Backend selector for the shared implementation file included below. See the comment at the
 // top of that file for the full contract.
 #define KATAGO_GPU_CUDA 1

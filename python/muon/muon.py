@@ -20,6 +20,26 @@ def _env_flag(name: str, default: bool) -> bool:
     raise ValueError(f"Environment variable {name} must be exactly '0' or '1', got {value!r}")
 
 
+# Newton-Schulz compute dtype. bf16 needs SM80+ tensor cores: on older GPUs (e.g. Tesla T4,
+# SM75) bf16 matmuls fall back to slow fp32 emulation (magma kernels), while fp16 runs on real
+# tensor cores and is at least as accurate as bf16 in the range NS operates in: entries are
+# bounded by the spectral norm (<= 1 after the normalization below), far below fp16 limits, and
+# fp16 has more mantissa bits than bf16 anyway.
+_NS_DTYPE_CACHE = {}
+
+
+def _ns_cast(G: torch.Tensor) -> torch.Tensor:
+    if G.device.type != "cuda":
+        return G.bfloat16()
+    idx = G.device.index if G.device.index is not None else torch.cuda.current_device()
+    dtype = _NS_DTYPE_CACHE.get(idx)
+    if dtype is None:
+        major, _ = torch.cuda.get_device_capability(idx)
+        dtype = torch.bfloat16 if major >= 8 else torch.float16
+        _NS_DTYPE_CACHE[idx] = dtype
+    return G.to(dtype)
+
+
 @torch.no_grad()
 def floored_weight_decay_(w: torch.Tensor, a: float, floor_norm: float):
     """Weight decay by factor (1 - a) that leaves each output channel a norm floor.
@@ -68,7 +88,7 @@ def zeropower_via_newtonschulz5(G, steps: int):
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    X = _ns_cast(G)
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -111,7 +131,7 @@ def zeropower_via_polar_express(G, steps: int):
     factor in the initial normalization.
     """
     assert G.ndim >= 2
-    X = G.bfloat16()
+    X = _ns_cast(G)
     if G.size(-2) > G.size(-1):
         X = X.mT
 

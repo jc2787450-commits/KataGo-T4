@@ -137,6 +137,19 @@ def _dual_gemm_swiglu_bwd_kernel(
 # and 128x128 tiles spill and run ~2x slower. Other GPUs may prefer different tiles.
 _FWD_CONFIG = dict(BLOCK_M=128, BLOCK_N=64, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=3)
 _BWD_CONFIG = dict(BLOCK_M=128, BLOCK_N=64, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=4)
+# Pre-Ampere GPUs (e.g. Tesla T4, SM75) have no cp.async and far fewer registers per SM than
+# the Blackwell the tiles above were tuned on: the 128x64 dual-accumulator footprint spills
+# catastrophically there (measured 288ms/call on T4, ~87% of a training step). Use a small tile
+# that fits comfortably. Off by default on such GPUs anyway via KATAGO_FUSED_SWIGLU_KERNEL=0;
+# this only makes the kernel usable if explicitly re-enabled for benchmarking.
+if torch.cuda.is_available():
+    try:
+        _cap_major, _ = torch.cuda.get_device_capability(0)
+    except Exception:
+        _cap_major = 8  # unknown device: keep the tuned configs
+    if _cap_major < 8:
+        _FWD_CONFIG = dict(BLOCK_M=64, BLOCK_N=32, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=2)
+        _BWD_CONFIG = dict(BLOCK_M=64, BLOCK_N=32, BLOCK_K=32, GROUP_M=8, num_warps=4, num_stages=2)
 # Neither kernel masks the K loop or the N tile, so K and N must be multiples of BLOCK_K and BLOCK_N.
 # _check_inputs enforces one shared constraint, so keep the two configs' BLOCK_K/BLOCK_N equal or
 # generalize it.
